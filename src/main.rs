@@ -4,16 +4,16 @@ use std::fs::{File, rename};
 use std::io::{BufReader, BufWriter, Write}; // Added Write for flushing stdout
 use std::path::{Path, PathBuf};
 use csv::{ReaderBuilder, Writer, StringRecord};
+use std::collections::HashMap; // To store header indices
 
 // --- Configuration ---
 // Name of the stops file within the GTFS directory
 const STOPS_FILENAME: &str = "stops.txt";
 // Temporary file suffix
 const TEMP_SUFFIX: &str = ".tmp";
-// 0-based index of the latitude column (Standard GTFS)
-const LAT_COLUMN_INDEX: usize = 4;
-// 0-based index of the longitude column (Standard GTFS)
-const LON_COLUMN_INDEX: usize = 5;
+// Target column names (case-insensitive comparison will be used)
+const LAT_COLUMN_NAME: &str = "stop_lat";
+const LON_COLUMN_NAME: &str = "stop_lon";
 // Number of decimal places for output coordinates
 const COORDINATE_PRECISION: usize = 8;
 // --- End Configuration ---
@@ -36,9 +36,42 @@ fn format_coordinate(value_str: &str) -> String {
     }
 }
 
+/// Finds the indices of specified columns in a CSV header record.
+/// Performs case-insensitive comparison.
+///
+/// # Arguments
+/// * `headers` - The StringRecord containing the header row.
+/// * `col_names` - A slice of strings representing the column names to find.
+///
+/// # Returns
+/// A `Result` containing a `HashMap` mapping column names to their 0-based indices,
+/// or an `Err` if any of the specified columns are not found.
+fn find_column_indices(headers: &StringRecord, col_names: &[&str]) -> Result<HashMap<String, usize>, Box<dyn Error>> {
+    let mut indices = HashMap::new();
+    // Create a map for quick lookup of header names and their indices
+    let header_map: HashMap<_, _> = headers.iter()
+        .enumerate()
+        .map(|(i, name)| (name.trim().to_lowercase(), i)) // Store lowercase names for case-insensitive lookup
+        .collect();
+
+    // Find the index for each required column name
+    for &name in col_names {
+        let lower_name = name.to_lowercase();
+        if let Some(&index) = header_map.get(&lower_name) {
+            // Store the original name (from col_names) and its found index
+            indices.insert(name.to_string(), index);
+        } else {
+            // If a required column is missing, return an error
+            return Err(format!("Required column '{}' not found in header.", name).into());
+        }
+    }
+    Ok(indices)
+}
+
+
 /// Reads the stops.txt file from the specified GTFS directory,
 /// fixes coordinate formats, and overwrites the original file.
-/// Uses a temporary file to ensure atomicity.
+/// Uses a temporary file to ensure atomicity. Finds columns dynamically.
 ///
 /// # Arguments
 /// * `gtfs_dir` - Path to the directory containing the GTFS files.
@@ -63,43 +96,45 @@ fn process_stops_file(gtfs_dir: &Path) -> Result<(), Box<dyn Error>> {
 
     // Configure CSV reader
     let mut csv_reader = ReaderBuilder::new()
-        .has_headers(true) // Assume the first row is a header
+        .has_headers(true) // Read the first row as a header
         .from_reader(reader);
 
     // --- Temporary Output File Handling ---
-    // Create the temporary file for writing
     let temp_output_file = File::create(&temp_output_path)?;
     let writer = BufWriter::new(temp_output_file);
     let mut csv_writer = Writer::from_writer(writer);
 
-    // --- Header Processing ---
+    // --- Header Processing & Column Index Finding ---
     let headers = csv_reader.headers()?.clone(); // Clone to own the data
 
-    // Validate column indices
-    if headers.len() <= LAT_COLUMN_INDEX || headers.len() <= LON_COLUMN_INDEX {
-         eprintln!(
-            "Error: CSV file '{}' has fewer columns ({}) than expected for lat ({}) or lon ({}).",
-            input_path.display(),
-            headers.len(),
-            LAT_COLUMN_INDEX + 1, // Display 1-based index to user
-            LON_COLUMN_INDEX + 1
-        );
-        // Clean up the temporary file before erroring
-        std::fs::remove_file(&temp_output_path)?;
-        return Err("Insufficient columns in CSV header.".into());
-    }
-     println!(
-        "Identified Latitude column: '{}' (Index {})",
-        headers.get(LAT_COLUMN_INDEX).unwrap_or("N/A"),
-        LAT_COLUMN_INDEX
+    // Find the indices of the latitude and longitude columns dynamically
+    let required_columns = [LAT_COLUMN_NAME, LON_COLUMN_NAME];
+    let column_indices = match find_column_indices(&headers, &required_columns) {
+         Ok(indices) => indices,
+         Err(e) => {
+            // Clean up the temporary file before returning the error
+            eprintln!("Error finding columns in '{}': {}", input_path.display(), e);
+            std::fs::remove_file(&temp_output_path)?;
+            return Err(e);
+         }
+    };
+
+    // Retrieve the specific indices (unwrap is safe here due to the check in find_column_indices)
+    let lat_col_idx = *column_indices.get(LAT_COLUMN_NAME).unwrap();
+    let lon_col_idx = *column_indices.get(LON_COLUMN_NAME).unwrap();
+
+    println!(
+        "Found Latitude column: '{}' (Index {})",
+        headers.get(lat_col_idx).unwrap_or("N/A"), // Get original header name for display
+        lat_col_idx
     );
-     println!(
-        "Identified Longitude column: '{}' (Index {})",
-        headers.get(LON_COLUMN_INDEX).unwrap_or("N/A"),
-        LON_COLUMN_INDEX
+    println!(
+        "Found Longitude column: '{}' (Index {})",
+        headers.get(lon_col_idx).unwrap_or("N/A"), // Get original header name for display
+        lon_col_idx
     );
 
-    // Write the header to the temporary output file
+    // Write the original header to the temporary output file
     csv_writer.write_record(&headers)?;
     println!("Header written to temporary file '{}'.", temp_output_path.display());
 
@@ -107,15 +142,17 @@ fn process_stops_file(gtfs_dir: &Path) -> Result<(), Box<dyn Error>> {
     let mut processed_count = 0;
     let mut record = StringRecord::new(); // Reusable record
 
-    // Iterate over each record in the input file
+    // Iterate over each data record in the input file
     while csv_reader.read_record(&mut record)? {
         let mut output_fields: Vec<String> = Vec::with_capacity(record.len());
 
-        // Process each field, formatting coordinates as needed
+        // Process each field, formatting coordinates based on the found indices
         for (index, field) in record.iter().enumerate() {
-            let processed_field = if index == LAT_COLUMN_INDEX || index == LON_COLUMN_INDEX {
+            let processed_field = if index == lat_col_idx || index == lon_col_idx {
+                // If it's the dynamically found lat or lon column, format it
                 format_coordinate(field)
             } else {
+                // Otherwise, keep the field as is
                 field.to_string()
             };
             output_fields.push(processed_field);
@@ -140,7 +177,6 @@ fn process_stops_file(gtfs_dir: &Path) -> Result<(), Box<dyn Error>> {
 
     // --- Replace Original File ---
     // Rename the temporary file to the original filename, overwriting it.
-    // This is generally an atomic operation on most filesystems.
     rename(&temp_output_path, &input_path)?;
     println!("Successfully replaced '{}' with the processed data.", input_path.display());
 
@@ -188,4 +224,3 @@ fn main() {
 
     println!("Processing complete.");
 }
-
